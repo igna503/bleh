@@ -8,7 +8,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"image"
 	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -119,25 +124,37 @@ const (
 	bytesPerLine = linePixels / 8
 )
 
-// Convert image to 1bpp, dithered, and packed bytes
-func loadImageMono(path string, ditherType string) ([]byte, int, error) {
+// decodeImage loads an image from a given path or stdin ("-")
+func decodeImage(path string) (image.Image, error) {
+	if path == "-" {
+		return decodeImageFromReader(os.Stdin)
+	}
 	img, err := imaging.Open(path, imaging.AutoOrientation(true))
 	if err != nil {
-		return nil, 0, fmt.Errorf("image open error: %v", err)
+		return nil, fmt.Errorf("failed to open image %q: %v", path, err)
 	}
+	return img, nil
+}
 
+// decodeImageFromReader reads and decodes an image from any io.Reader
+func decodeImageFromReader(r io.Reader) (image.Image, error) {
+	img, _, err := image.Decode(r)
+	if err != nil {
+		return nil, fmt.Errorf("decode error: %v", err)
+	}
+	return img, nil
+}
+
+// loadImageMonoFromImage processes an image.Image to 1bpp packed byte format
+func loadImageMonoFromImage(img image.Image, ditherType string) ([]byte, int, error) {
 	ratio := float64(img.Bounds().Dx()) / float64(img.Bounds().Dy())
 	height := int(float64(linePixels) / ratio)
 	img = imaging.Resize(img, linePixels, height, imaging.Lanczos)
 	img = imaging.Grayscale(img)
 
 	if ditherType != "none" {
-		palette := []color.Color{
-			color.RGBA{0, 0, 0, 0xFF},
-			color.RGBA{0xFF, 0xFF, 0xFF, 0xFF},
-		}
+		palette := []color.Color{color.Black, color.White}
 		d := dither.NewDitherer(palette)
-
 		switch ditherType {
 		case "floyd":
 			d.Matrix = dither.FloydSteinberg
@@ -156,11 +173,7 @@ func loadImageMono(path string, ditherType string) ([]byte, int, error) {
 		default:
 			return nil, 0, fmt.Errorf("unknown dither type: %s", ditherType)
 		}
-
-		img := d.DitherCopy(img)
-		if img == nil {
-			return nil, 0, fmt.Errorf("d.Dither(img) returned nil")
-		}
+		img = d.DitherCopy(img)
 	} else {
 		img = imaging.AdjustContrast(img, 10)
 	}
@@ -171,8 +184,7 @@ func loadImageMono(path string, ditherType string) ([]byte, int, error) {
 			gray := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
 			if gray.Y < 128 {
 				idx := (y*linePixels + x) / 8
-				bit := x % 8
-				pixels[idx] |= 1 << bit
+				pixels[idx] |= 1 << (x % 8)
 			}
 		}
 	}
@@ -180,14 +192,10 @@ func loadImageMono(path string, ditherType string) ([]byte, int, error) {
 	return pixels, height, nil
 }
 
-func loadImage4Bit(path string) ([]byte, int, error) {
-	img, err := imaging.Open(path, imaging.AutoOrientation(true))
-	if err != nil {
-		return nil, 0, fmt.Errorf("image open error: %v", err)
-	}
-
-	aspectRatio := float64(img.Bounds().Dx()) / float64(img.Bounds().Dy())
-	height := int(float64(linePixels) / aspectRatio)
+// loadImage4BitFromImage processes an image.Image to 4bpp packed byte format
+func loadImage4BitFromImage(img image.Image) ([]byte, int, error) {
+	ratio := float64(img.Bounds().Dx()) / float64(img.Bounds().Dy())
+	height := int(float64(linePixels) / ratio)
 	img = imaging.Resize(img, linePixels, height, imaging.Lanczos)
 	img = imaging.Grayscale(img)
 
@@ -195,12 +203,10 @@ func loadImage4Bit(path string) ([]byte, int, error) {
 	for y := 0; y < height; y++ {
 		for x := 0; x < linePixels; x++ {
 			gray := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
-			// Direct port: invert and quantize
 			level := (255 - gray.Y) >> 4
 
 			idx := (y*linePixels + x) >> 1
-			shift := uint(((x & 1) ^ 1) << 2) // 4 if even, 0 if odd (matches C#)
-
+			shift := uint(((x & 1) ^ 1) << 2) // 4 if even, 0 if odd
 			pixels[idx] |= level << shift
 		}
 	}
@@ -216,26 +222,7 @@ const (
 	Mode4bpp PrintMode = 0x02
 )
 
-func sendImageToPrinter(client ble.Client, dataChr, printChr *ble.Characteristic, path string, mode PrintMode, intensity byte) error {
-	var (
-		pixels       []byte
-		height       int
-		err          error
-		bytesPerLine int
-	)
-
-	if mode == Mode4bpp {
-		pixels, height, err = loadImage4Bit(path)
-		bytesPerLine = linePixels / 2
-	} else {
-		pixels, height, err = loadImageMono(path, *ditherType)
-		bytesPerLine = linePixels / 8
-	}
-
-	if err != nil {
-		return err
-	}
-
+func sendImageBufferToPrinter(client ble.Client, dataChr, printChr *ble.Characteristic, pixels []byte, height int, mode PrintMode, intensity byte) error {
 	fmt.Printf("Sending image: %dx%d lines\n", linePixels, height)
 
 	cmd := buildCommand(0xA2, []byte{intensity})
@@ -243,9 +230,8 @@ func sendImageToPrinter(client ble.Client, dataChr, printChr *ble.Characteristic
 		return fmt.Errorf("intensity set failed: %v", err)
 	}
 
-	lines := height
 	param := []byte{
-		byte(lines & 0xFF), byte(lines >> 8),
+		byte(height & 0xFF), byte(height >> 8),
 		0x30,
 		byte(mode),
 	}
@@ -254,15 +240,20 @@ func sendImageToPrinter(client ble.Client, dataChr, printChr *ble.Characteristic
 		return fmt.Errorf("print command failed: %v", err)
 	}
 
-	mtu := 20 // BLE default payload size; adjust if you've negotiated a higher MTU
-	for y := 0; y < lines; y++ {
+	bytesPerLine := linePixels / 8
+	if mode == Mode4bpp {
+		bytesPerLine = linePixels / 2
+	}
+
+	mtu := 20
+	for y := 0; y < height; y++ {
 		slice := pixels[y*bytesPerLine : (y+1)*bytesPerLine]
-
-		// Split into MTU-friendly chunks
 		for offset := 0; offset < len(slice); offset += mtu {
-			end := min(offset+mtu, len(slice))
+			end := offset + mtu
+			if end > len(slice) {
+				end = len(slice)
+			}
 			chunk := slice[offset:end]
-
 			if err := client.WriteCharacteristic(dataChr, chunk, true); err != nil {
 				return fmt.Errorf("line %d chunk write failed: %v", y, err)
 			}
@@ -281,7 +272,7 @@ func sendImageToPrinter(client ble.Client, dataChr, printChr *ble.Characteristic
 func main() {
 	flag.Parse()
 	if flag.NArg() < 1 {
-		fmt.Println("Usage: catprinter-ble [flags] <image_path>")
+		fmt.Println("Usage: catprinter-ble [flags] <image_path or ->")
 		flag.PrintDefaults()
 		return
 	}
@@ -305,6 +296,24 @@ func main() {
 	default:
 		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
 		return
+	}
+
+	img, err := decodeImage(imagePath)
+	if err != nil {
+		log.Fatalf("Image load error: %v", err)
+	}
+
+	var pixels []byte
+	var height int
+
+	switch printMode {
+	case Mode1bpp:
+		pixels, height, err = loadImageMonoFromImage(img, *ditherType)
+	case Mode4bpp:
+		pixels, height, err = loadImage4BitFromImage(img)
+	}
+	if err != nil {
+		log.Fatalf("Image conversion error: %v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -343,7 +352,7 @@ func main() {
 
 	mtu, err := client.ExchangeMTU(100)
 	if err != nil {
-		log.Printf("MTU negotiation failed, continuing with default MTU. Reason: %v", err)
+		log.Printf("MTU negotiation failed: %v", err)
 	} else {
 		log.Printf("Negotiated ATT MTU: %d", mtu)
 	}
@@ -355,7 +364,7 @@ func main() {
 	svc := services[0]
 	chars, err := client.DiscoverCharacteristics(nil, svc)
 	if err != nil {
-		log.Fatalf("Char discovery failed: %v", err)
+		log.Fatalf("Characteristic discovery failed: %v", err)
 	}
 
 	var printChr, dataChr *ble.Characteristic
@@ -368,10 +377,10 @@ func main() {
 		}
 	}
 	if printChr == nil || dataChr == nil {
-		log.Fatalf("Required characteristics missing")
+		log.Fatalf("Missing required BLE characteristics")
 	}
 
-	err = sendImageToPrinter(client, dataChr, printChr, imagePath, printMode, intensityByte)
+	err = sendImageBufferToPrinter(client, dataChr, printChr, pixels, height, printMode, intensityByte)
 	if err != nil {
 		log.Fatalf("Failed to print image: %v", err)
 	}
