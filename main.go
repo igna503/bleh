@@ -449,11 +449,24 @@ func main() {
 		case Mode4bpp:
 			previewImg = renderPreviewFrom4bpp(pixels, linePixels, height)
 		}
-		err = imaging.Save(previewImg, outputPath)
-		if err != nil {
-			log.Fatalf("Failed to save PNG preview: %v", err)
+		var out io.Writer
+		if outputPath == "-" {
+			out = os.Stdout
+		} else {
+			f, err := os.Create(outputPath)
+			if err != nil {
+				log.Fatalf("Failed to create output file: %v", err)
+			}
+			defer f.Close()
+			out = f
 		}
-		fmt.Printf("Preview PNG written to %s\n", outputPath)
+		err = imaging.Encode(out, previewImg, imaging.PNG)
+		if err != nil {
+			log.Fatalf("Failed to write PNG preview: %v", err)
+		}
+		if outputPath != "-" {
+			fmt.Printf("Preview PNG written to %s\n", outputPath)
+		}
 		return
 	}
 
