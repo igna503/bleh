@@ -52,6 +52,7 @@ var (
 	getQueryCount        bool
 	ejectPaper           uint
 	retractPaper         uint
+	outputPath           string
 )
 
 func init() {
@@ -84,6 +85,9 @@ func init() {
 
 	flag.UintVar(&retractPaper, "retract", 0, "Retract paper by N lines")
 	flag.UintVar(&retractPaper, "R", 0, "Retract paper by N lines")
+
+	flag.StringVar(&outputPath, "o", "", "Output PNG preview instead of printing (specify output path)")
+	flag.StringVar(&outputPath, "output", "", "Output PNG preview instead of printing (specify output path)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <image_path or ->\n", os.Args[0])
@@ -373,8 +377,85 @@ func sendLineCommand(client ble.Client, printChr *ble.Characteristic, cmdId byte
 	return client.WriteCharacteristic(printChr, cmd, true)
 }
 
+func renderPreviewFrom1bpp(pixels []byte, width, height int) image.Image {
+	img := image.NewGray(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			idx := (y*width + x) / 8
+			bit := uint(x % 8)
+			if pixels[idx]&(1<<bit) != 0 {
+				img.SetGray(x, y, color.Gray{Y: 0})
+			} else {
+				img.SetGray(x, y, color.Gray{Y: 255})
+			}
+		}
+	}
+	return img
+}
+
+func renderPreviewFrom4bpp(pixels []byte, width, height int) image.Image {
+	img := image.NewGray(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			idx := (y*width + x) >> 1
+			shift := uint(((x & 1) ^ 1) << 2)
+			val := (pixels[idx] >> shift) & 0x0F
+			gray := 255 - val*17
+			img.SetGray(x, y, color.Gray{Y: gray})
+		}
+	}
+	return img
+}
+
 func main() {
 	flag.Parse()
+
+	var printMode PrintMode
+	switch mode {
+	case "1bpp":
+		printMode = Mode1bpp
+	case "4bpp":
+		printMode = Mode4bpp
+	default:
+		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
+		return
+	}
+	imagePath := flag.Arg(0)
+
+	var pixels []byte
+	var height int
+	img, err := decodeImage(imagePath)
+
+	if err != nil {
+		log.Fatalf("Image load error: %v", err)
+	}
+	img = padImageToMinLines(img, minLines)
+
+	switch printMode {
+	case Mode1bpp:
+		pixels, height, err = loadImageMonoFromImage(img, ditherType)
+	case Mode4bpp:
+		pixels, height, err = loadImage4BitFromImage(img)
+	}
+	if err != nil {
+		log.Fatalf("Image conversion error: %v", err)
+	}
+
+	if outputPath != "" {
+		var previewImg image.Image
+		switch printMode {
+		case Mode1bpp:
+			previewImg = renderPreviewFrom1bpp(pixels, linePixels, height)
+		case Mode4bpp:
+			previewImg = renderPreviewFrom4bpp(pixels, linePixels, height)
+		}
+		err = imaging.Save(previewImg, outputPath)
+		if err != nil {
+			log.Fatalf("Failed to save PNG preview: %v", err)
+		}
+		fmt.Printf("Preview PNG written to %s\n", outputPath)
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -442,17 +523,15 @@ func main() {
 		log.Fatalf("Missing required print characteristic")
 	}
 
-	if notifyChr != nil {
-		// 1) Make sure the CCCD has been discovered so Subscribe can succeed.
-		_, _ = client.DiscoverDescriptors(nil, notifyChr)
+	needNotifications := getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0
 
-		// 2) Now subscribe.  This registers the notification handler **and**
-		//    writes 0x01-00 to the CCCD for us.
+	if notifyChr != nil && needNotifications {
+		_, _ = client.DiscoverDescriptors(nil, notifyChr)
 		err = client.Subscribe(notifyChr, false, func(b []byte) {
 			parseNotification(b)
 		})
 		if err != nil {
-			log.Printf("Subscribe still failed: %v – notifications will be ignored", err)
+			log.Printf("Subscribe failed: %v – notifications will be ignored", err)
 		} else {
 			log.Println("Subscribed to printer notifications.")
 		}
@@ -486,9 +565,10 @@ func main() {
 	}
 	if flag.NArg() < 1 {
 		return // no image to print, other commands may have run
+	} else if flag.NArg() >= 1 && needNotifications {
+		log.Fatalf("Refusing to print and query at the same time due to a firmware bug. Please run print and query commands separately.")
 	}
 
-	imagePath := flag.Arg(0)
 	i := intensity
 	if i < 0 {
 		i = 0
@@ -497,36 +577,6 @@ func main() {
 		i = 100
 	}
 	intensityByte := byte(i)
-
-	var printMode PrintMode
-	switch mode {
-	case "1bpp":
-		printMode = Mode1bpp
-	case "4bpp":
-		printMode = Mode4bpp
-	default:
-		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
-		return
-	}
-
-	img, err := decodeImage(imagePath)
-	if err != nil {
-		log.Fatalf("Image load error: %v", err)
-	}
-	img = padImageToMinLines(img, minLines)
-
-	var pixels []byte
-	var height int
-
-	switch printMode {
-	case Mode1bpp:
-		pixels, height, err = loadImageMonoFromImage(img, ditherType)
-	case Mode4bpp:
-		pixels, height, err = loadImage4BitFromImage(img)
-	}
-	if err != nil {
-		log.Fatalf("Image conversion error: %v", err)
-	}
 
 	if dataChr == nil {
 		log.Fatalf("Missing required data characteristic")
