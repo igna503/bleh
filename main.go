@@ -25,6 +25,8 @@ import (
 	dither "github.com/makeworld-the-better-one/dither"
 )
 
+const minLines = 86 // firmware refuses to print anything shorter
+
 var (
 	mainServiceUUID      = ble.MustParse("ae30")
 	printCharacteristic  = ble.MustParse("ae01")
@@ -38,13 +40,6 @@ var (
 	mode                 = flag.String("mode", "1bpp", "Print mode: 1bpp or 4bpp")
 	ditherType           = flag.String("dither", "none", "Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn")
 )
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func dumpCharacteristics(client ble.Client, svc *ble.Service) {
 	chars, err := client.DiscoverCharacteristics(nil, svc)
@@ -269,6 +264,18 @@ func sendImageBufferToPrinter(client ble.Client, dataChr, printChr *ble.Characte
 	return nil
 }
 
+func padImageToMinLines(img image.Image, minLines int) image.Image {
+	bounds := img.Bounds()
+	if bounds.Dy() >= minLines {
+		return img
+	}
+	// Create a new white image
+	dst := imaging.New(bounds.Dx(), minLines, color.White)
+	// Paste the original image at the top
+	dst = imaging.Paste(dst, img, image.Pt(0, 0))
+	return dst
+}
+
 func main() {
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -302,6 +309,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Image load error: %v", err)
 	}
+	img = padImageToMinLines(img, minLines)
 
 	var pixels []byte
 	var height int
