@@ -1,4 +1,4 @@
-module catprinter-ble
+module bleh
 
 go 1.22
 

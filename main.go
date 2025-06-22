@@ -1,4 +1,4 @@
-// catprinter_ble.go
+// Bleh!
 // A Go reimplementation of the CatPrinterBLE utility
 // using Go's BLE stack and Image processing libraries
 
