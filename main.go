@@ -1,5 +1,5 @@
 // Bleh!
-// A Go reimplementation of the CatPrinterBLE utility
+// A Go reimplementation of PacoChan's CatPrinterBLE utility
 // using Go's BLE stack and Image processing libraries
 
 package main
@@ -39,6 +39,13 @@ var (
 	intensity            = flag.Int("intensity", 80, "Print intensity (0-100)")
 	mode                 = flag.String("mode", "1bpp", "Print mode: 1bpp or 4bpp")
 	ditherType           = flag.String("dither", "none", "Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn")
+	getStatus            = flag.Bool("status", false, "Query printer status")
+	getBattery           = flag.Bool("battery", false, "Query battery level")
+	getVersion           = flag.Bool("version", false, "Query printer version")
+	getPrintType         = flag.Bool("printtype", false, "Query print type")
+	getQueryCount        = flag.Bool("querycount", false, "Query internal counter")
+	ejectPaper           = flag.Uint("eject", 0, "Eject paper by N lines")
+	retractPaper         = flag.Uint("retract", 0, "Retract paper by N lines")
 )
 
 func dumpCharacteristics(client ble.Client, svc *ble.Service) {
@@ -77,6 +84,8 @@ func parseNotification(data []byte) {
 	}
 
 	cmd := data[2]
+	dataLen := int(data[4]) | int(data[5])<<8
+
 	switch cmd {
 	case 0xA1: // GetStatus
 		battery := data[9]
@@ -109,8 +118,59 @@ func parseNotification(data []byte) {
 		}
 
 		fmt.Printf("Status: %v (%s), Battery: %d, Temp: %d\n", statusOk, statusMsg, battery, temp)
+
+	case 0xA3: // EjectPaper
+		fmt.Println("Ejecting paper...")
+
+	case 0xA4: // RetractPaper
+		fmt.Println("Retracting paper...")
+
+	case 0xA7: // QueryCount
+		if len(data) >= 12 {
+			fmt.Printf("Query count: % X\n", data[6:12])
+		}
+
+	case 0xA9: // Print
+		printOk := data[6] == 0
+		fmt.Printf("Print status: %s\n", map[bool]string{true: "Ok", false: "Failure"}[printOk])
+
+	case 0xAA: // PrintComplete
+		fmt.Println("Printing finished.")
+
+	case 0xAB: // BatteryLevel
+		fmt.Printf("Battery level: %d\n", data[6])
+
+	case 0xB0: // GetPrintType
+		var t string
+		switch data[6] {
+		case 0x01:
+			t = `"gaoya" (High pressure?)`
+		case 0xFF:
+			t = `"weishibie" (???)`
+		default:
+			t = `"diya" (Low pressure?)`
+		}
+		fmt.Printf("Print type: %s\n", t)
+
+	case 0xB1: // GetVersion
+		if len(data) < 14+dataLen {
+			fmt.Println("Malformed version notification")
+			return
+		}
+		version := string(data[6 : 6+dataLen])
+		var t string
+		switch data[14] {
+		case 0x32:
+			t = `"gaoya" (High pressure?)`
+		case 0x31:
+			t = `"diya" (Low pressure?)`
+		default:
+			t = `"weishibie" (???)`
+		}
+		fmt.Printf("Version: %s, Print type: %s\n", version, t)
+
 	default:
-		fmt.Printf("Unhandled command: 0x%02X\n", cmd)
+		fmt.Printf("Received notification for unknown command: 0x%02X\n", cmd)
 	}
 }
 
@@ -276,53 +336,19 @@ func padImageToMinLines(img image.Image, minLines int) image.Image {
 	return dst
 }
 
+func sendSimpleCommand(client ble.Client, printChr *ble.Characteristic, cmdId byte) error {
+	cmd := buildCommand(cmdId, []byte{0x00})
+	return client.WriteCharacteristic(printChr, cmd, true)
+}
+
+func sendLineCommand(client ble.Client, printChr *ble.Characteristic, cmdId byte, lines uint) error {
+	param := []byte{byte(lines & 0xFF), byte(lines >> 8)}
+	cmd := buildCommand(cmdId, param)
+	return client.WriteCharacteristic(printChr, cmd, true)
+}
+
 func main() {
 	flag.Parse()
-	if flag.NArg() < 1 {
-		fmt.Println("Usage: catprinter-ble [flags] <image_path or ->")
-		flag.PrintDefaults()
-		return
-	}
-
-	imagePath := flag.Arg(0)
-	i := *intensity
-	if i < 0 {
-		i = 0
-	}
-	if i > 100 {
-		i = 100
-	}
-	intensityByte := byte(i)
-
-	var printMode PrintMode
-	switch *mode {
-	case "1bpp":
-		printMode = Mode1bpp
-	case "4bpp":
-		printMode = Mode4bpp
-	default:
-		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
-		return
-	}
-
-	img, err := decodeImage(imagePath)
-	if err != nil {
-		log.Fatalf("Image load error: %v", err)
-	}
-	img = padImageToMinLines(img, minLines)
-
-	var pixels []byte
-	var height int
-
-	switch printMode {
-	case Mode1bpp:
-		pixels, height, err = loadImageMonoFromImage(img, *ditherType)
-	case Mode4bpp:
-		pixels, height, err = loadImage4BitFromImage(img)
-	}
-	if err != nil {
-		log.Fatalf("Image conversion error: %v", err)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -375,17 +401,119 @@ func main() {
 		log.Fatalf("Characteristic discovery failed: %v", err)
 	}
 
-	var printChr, dataChr *ble.Characteristic
+	var printChr, dataChr, notifyChr *ble.Characteristic
 	for _, c := range chars {
 		switch c.UUID.String() {
 		case printCharacteristic.String():
 			printChr = c
 		case dataCharacteristic.String():
 			dataChr = c
+		case notifyCharacteristic.String():
+			notifyChr = c
 		}
 	}
-	if printChr == nil || dataChr == nil {
-		log.Fatalf("Missing required BLE characteristics")
+	if printChr == nil {
+		log.Fatalf("Missing required print characteristic")
+	}
+
+	if notifyChr != nil {
+		err = client.Subscribe(notifyChr, false, func(req []byte) {
+			parseNotification(req)
+		})
+		if err != nil {
+			log.Printf("Warning: failed to subscribe to notifications (no CCCD?): %v", err)
+			log.Println("Attempting to force notifications manually...")
+
+			descriptors, derr := client.DiscoverDescriptors(nil, notifyChr)
+			if derr != nil || len(descriptors) == 0 {
+				log.Println("No descriptors found; device likely does not expose CCCD")
+			} else {
+				for _, d := range descriptors {
+					if d.UUID.Equal(ble.ClientCharacteristicConfigUUID) {
+						err := client.WriteDescriptor(d, []byte{0x01, 0x00}) // enable notification
+						if err != nil {
+							log.Printf("Failed to write CCCD descriptor: %v", err)
+						} else {
+							log.Println("Manually enabled notifications via CCCD write")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Execute simple commands first
+	if *getStatus {
+		sendSimpleCommand(client, printChr, 0xA1)
+	}
+	if *getBattery {
+		sendSimpleCommand(client, printChr, 0xAB)
+	}
+	if *getVersion {
+		sendSimpleCommand(client, printChr, 0xB1)
+	}
+	if *getPrintType {
+		sendSimpleCommand(client, printChr, 0xB0)
+	}
+	if *getQueryCount {
+		sendSimpleCommand(client, printChr, 0xA7)
+	}
+	if *ejectPaper > 0 {
+		sendLineCommand(client, printChr, 0xA3, *ejectPaper)
+	}
+	if *retractPaper > 0 {
+		sendLineCommand(client, printChr, 0xA4, *retractPaper)
+	}
+	if *getStatus || *getBattery || *getVersion || *getPrintType || *getQueryCount || *ejectPaper > 0 || *retractPaper > 0 {
+		log.Println("Waiting for notifications...")
+		time.Sleep(2 * time.Second)
+	}
+	if flag.NArg() < 1 {
+		return // no image to print, other commands may have run
+	}
+
+	imagePath := flag.Arg(0)
+	i := *intensity
+	if i < 0 {
+		i = 0
+	}
+	if i > 100 {
+		i = 100
+	}
+	intensityByte := byte(i)
+
+	var printMode PrintMode
+	switch *mode {
+	case "1bpp":
+		printMode = Mode1bpp
+	case "4bpp":
+		printMode = Mode4bpp
+	default:
+		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
+		return
+	}
+
+	img, err := decodeImage(imagePath)
+	if err != nil {
+		log.Fatalf("Image load error: %v", err)
+	}
+	img = padImageToMinLines(img, minLines)
+
+	var pixels []byte
+	var height int
+
+	switch printMode {
+	case Mode1bpp:
+		pixels, height, err = loadImageMonoFromImage(img, *ditherType)
+	case Mode4bpp:
+		pixels, height, err = loadImage4BitFromImage(img)
+	}
+	if err != nil {
+		log.Fatalf("Image conversion error: %v", err)
+	}
+
+	if dataChr == nil {
+		log.Fatalf("Missing required data characteristic")
 	}
 
 	err = sendImageBufferToPrinter(client, dataChr, printChr, pixels, height, printMode, intensityByte)
