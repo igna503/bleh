@@ -103,6 +103,8 @@ Options:
   -q, --querycount         Query internal counter
   -E, --eject uint         Eject paper by N lines
   -R, --retract uint       Retract paper by N lines
+  -o, --output <file>      Output PNG preview instead of printing.
+                           If <file> is "-", writes PNG to stdout.
   <image_path or ->        Path to PNG/JPG to print, or '-' for stdin`)
 	}
 }
