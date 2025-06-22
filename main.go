@@ -1,6 +1,12 @@
-// Bleh!
-// A Go reimplementation of PacoChan's CatPrinterBLE utility
-// using Go's BLE stack and Image processing libraries
+/*
+This file is part of Bleh!.
+
+Bleh! is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+Bleh! is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with Foobar. If not, see <https://www.gnu.org/licenses/>.
+*/
 
 package main
 
@@ -36,50 +42,70 @@ var (
 	scanTimeout          = 10 * time.Second
 	printCommandHeader   = []byte{0x22, 0x21}
 	printCommandFooter   = byte(0xFF)
-	intensity            = flag.Int("intensity", 80, "Print intensity (0-100)")
-	mode                 = flag.String("mode", "1bpp", "Print mode: 1bpp or 4bpp")
-	ditherType           = flag.String("dither", "none", "Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn")
-	getStatus            = flag.Bool("status", false, "Query printer status")
-	getBattery           = flag.Bool("battery", false, "Query battery level")
-	getVersion           = flag.Bool("version", false, "Query printer version")
-	getPrintType         = flag.Bool("printtype", false, "Query print type")
-	getQueryCount        = flag.Bool("querycount", false, "Query internal counter")
-	ejectPaper           = flag.Uint("eject", 0, "Eject paper by N lines")
-	retractPaper         = flag.Uint("retract", 0, "Retract paper by N lines")
+	intensity            int
+	mode                 string
+	ditherType           string
+	getStatus            bool
+	getBattery           bool
+	getVersion           bool
+	getPrintType         bool
+	getQueryCount        bool
+	ejectPaper           uint
+	retractPaper         uint
 )
 
-func dumpCharacteristics(client ble.Client, svc *ble.Service) {
-	chars, err := client.DiscoverCharacteristics(nil, svc)
-	if err != nil {
-		log.Fatalf("Error discovering characteristics: %v", err)
-	}
+func init() {
+	flag.IntVar(&intensity, "intensity", 80, "Print intensity (0-100)")
+	flag.IntVar(&intensity, "i", 80, "Print intensity (0-100)")
 
-	log.Printf("Discovered %d characteristics:", len(chars))
-	for _, c := range chars {
-		props := ""
-		if c.Property&ble.CharRead != 0 {
-			props += "Read "
-		}
-		if c.Property&ble.CharWrite != 0 {
-			props += "Write "
-		}
-		if c.Property&ble.CharWriteNR != 0 {
-			props += "WriteWithoutResponse "
-		}
-		if c.Property&ble.CharNotify != 0 {
-			props += "Notify "
-		}
-		if c.Property&ble.CharIndicate != 0 {
-			props += "Indicate "
-		}
+	flag.StringVar(&mode, "mode", "1bpp", "Print mode: 1bpp or 4bpp")
+	flag.StringVar(&mode, "m", "1bpp", "Print mode: 1bpp or 4bpp")
 
-		log.Printf("  UUID: %s, Properties: %s", c.UUID, props)
+	flag.StringVar(&ditherType, "dither", "none", "Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn")
+	flag.StringVar(&ditherType, "d", "none", "Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn")
+
+	flag.BoolVar(&getStatus, "status", false, "Query printer status")
+	flag.BoolVar(&getStatus, "s", false, "Query printer status")
+
+	flag.BoolVar(&getBattery, "battery", false, "Query battery level")
+	flag.BoolVar(&getBattery, "b", false, "Query battery level")
+
+	flag.BoolVar(&getVersion, "version", false, "Query printer version")
+	flag.BoolVar(&getVersion, "v", false, "Query printer version")
+
+	flag.BoolVar(&getPrintType, "printtype", false, "Query print type")
+	flag.BoolVar(&getPrintType, "p", false, "Query print type")
+
+	flag.BoolVar(&getQueryCount, "querycount", false, "Query internal counter")
+	flag.BoolVar(&getQueryCount, "q", false, "Query internal counter")
+
+	flag.UintVar(&ejectPaper, "eject", 0, "Eject paper by N lines")
+	flag.UintVar(&ejectPaper, "E", 0, "Eject paper by N lines")
+
+	flag.UintVar(&retractPaper, "retract", 0, "Retract paper by N lines")
+	flag.UintVar(&retractPaper, "R", 0, "Retract paper by N lines")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <image_path or ->\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, `
+Options:
+  -i, --intensity int      Print intensity (0-100) (default 80)
+  -m, --mode string        Print mode: 1bpp or 4bpp (default "1bpp")
+  -d, --dither string      Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn (default "none")
+  -s, --status             Query printer status
+  -b, --battery            Query battery level
+  -v, --version            Query printer version
+  -p, --printtype          Query print type
+  -q, --querycount         Query internal counter
+  -E, --eject uint         Eject paper by N lines
+  -R, --retract uint       Retract paper by N lines
+  <image_path or ->        Path to PNG/JPG to print, or '-' for stdin`)
 	}
 }
 
 func parseNotification(data []byte) {
-	if len(data) < 10 || data[0] != 0x22 || data[1] != 0x21 {
-		fmt.Println("Invalid notification header")
+	if len(data) < 2 || data[0] != 0x22 || data[1] != 0x21 {
+		fmt.Printf("Invalid notification header, raw: % X", data)
 		return
 	}
 
@@ -144,11 +170,11 @@ func parseNotification(data []byte) {
 		var t string
 		switch data[6] {
 		case 0x01:
-			t = `"gaoya" (High pressure?)`
+			t = `High pressure`
 		case 0xFF:
-			t = `"weishibie" (???)`
+			t = `"Unknown`
 		default:
-			t = `"diya" (Low pressure?)`
+			t = `Low pressure`
 		}
 		fmt.Printf("Print type: %s\n", t)
 
@@ -161,11 +187,11 @@ func parseNotification(data []byte) {
 		var t string
 		switch data[14] {
 		case 0x32:
-			t = `"gaoya" (High pressure?)`
+			t = `High pressure`
 		case 0x31:
-			t = `"diya" (Low pressure?)`
+			t = `Low pressure`
 		default:
-			t = `"weishibie" (???)`
+			t = `Unknown`
 		}
 		fmt.Printf("Version: %s, Print type: %s\n", version, t)
 
@@ -362,7 +388,7 @@ func main() {
 	log.Println("Scanning for printer...")
 
 	var adv ble.Advertisement
-	ctxScan, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
 	err = ble.Scan(ctxScan, false, func(a ble.Advertisement) {
 		if a.LocalName() == targetPrinterName {
 			adv = a
@@ -417,54 +443,44 @@ func main() {
 	}
 
 	if notifyChr != nil {
-		err = client.Subscribe(notifyChr, false, func(req []byte) {
-			parseNotification(req)
+		// 1) Make sure the CCCD has been discovered so Subscribe can succeed.
+		_, _ = client.DiscoverDescriptors(nil, notifyChr)
+
+		// 2) Now subscribe.  This registers the notification handler **and**
+		//    writes 0x01-00 to the CCCD for us.
+		err = client.Subscribe(notifyChr, false, func(b []byte) {
+			parseNotification(b)
 		})
 		if err != nil {
-			log.Printf("Warning: failed to subscribe to notifications (no CCCD?): %v", err)
-			log.Println("Attempting to force notifications manually...")
-
-			descriptors, derr := client.DiscoverDescriptors(nil, notifyChr)
-			if derr != nil || len(descriptors) == 0 {
-				log.Println("No descriptors found; device likely does not expose CCCD")
-			} else {
-				for _, d := range descriptors {
-					if d.UUID.Equal(ble.ClientCharacteristicConfigUUID) {
-						err := client.WriteDescriptor(d, []byte{0x01, 0x00}) // enable notification
-						if err != nil {
-							log.Printf("Failed to write CCCD descriptor: %v", err)
-						} else {
-							log.Println("Manually enabled notifications via CCCD write")
-						}
-					}
-				}
-			}
+			log.Printf("Subscribe still failed: %v – notifications will be ignored", err)
+		} else {
+			log.Println("Subscribed to printer notifications.")
 		}
 	}
 
 	// Execute simple commands first
-	if *getStatus {
+	if getStatus {
 		sendSimpleCommand(client, printChr, 0xA1)
 	}
-	if *getBattery {
+	if getBattery {
 		sendSimpleCommand(client, printChr, 0xAB)
 	}
-	if *getVersion {
+	if getVersion {
 		sendSimpleCommand(client, printChr, 0xB1)
 	}
-	if *getPrintType {
+	if getPrintType {
 		sendSimpleCommand(client, printChr, 0xB0)
 	}
-	if *getQueryCount {
+	if getQueryCount {
 		sendSimpleCommand(client, printChr, 0xA7)
 	}
-	if *ejectPaper > 0 {
-		sendLineCommand(client, printChr, 0xA3, *ejectPaper)
+	if ejectPaper > 0 {
+		sendLineCommand(client, printChr, 0xA3, ejectPaper)
 	}
-	if *retractPaper > 0 {
-		sendLineCommand(client, printChr, 0xA4, *retractPaper)
+	if retractPaper > 0 {
+		sendLineCommand(client, printChr, 0xA4, retractPaper)
 	}
-	if *getStatus || *getBattery || *getVersion || *getPrintType || *getQueryCount || *ejectPaper > 0 || *retractPaper > 0 {
+	if getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0 {
 		log.Println("Waiting for notifications...")
 		time.Sleep(2 * time.Second)
 	}
@@ -473,7 +489,7 @@ func main() {
 	}
 
 	imagePath := flag.Arg(0)
-	i := *intensity
+	i := intensity
 	if i < 0 {
 		i = 0
 	}
@@ -483,7 +499,7 @@ func main() {
 	intensityByte := byte(i)
 
 	var printMode PrintMode
-	switch *mode {
+	switch mode {
 	case "1bpp":
 		printMode = Mode1bpp
 	case "4bpp":
@@ -504,7 +520,7 @@ func main() {
 
 	switch printMode {
 	case Mode1bpp:
-		pixels, height, err = loadImageMonoFromImage(img, *ditherType)
+		pixels, height, err = loadImageMonoFromImage(img, ditherType)
 	case Mode4bpp:
 		pixels, height, err = loadImage4BitFromImage(img)
 	}
