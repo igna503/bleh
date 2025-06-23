@@ -53,6 +53,7 @@ var (
 	ejectPaper           uint
 	retractPaper         uint
 	outputPath           string
+	version		     = "dev"
 )
 
 func init() {
@@ -90,6 +91,7 @@ func init() {
 	flag.StringVar(&outputPath, "output", "", "Output PNG preview instead of printing (specify output path)")
 
 	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Bleh! Cat Printer Utility for MXW01, version %s\n",version)
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <image_path or ->\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, `
 Options:
