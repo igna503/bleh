@@ -30,6 +30,12 @@ Then:
 go build
 ```
 
+If you want to be able to run it as a regular user, you'll need `setcap`:
+
+```
+sudo setcap cap_net_raw,cap_net_admin=eip ./bleh
+```
+
 ## Usage
 
 ```sh
