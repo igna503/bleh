@@ -1,6 +1,8 @@
 # Bleh!
 
-![bleh cat](./bleh.jpg)
+<p align=center>
+<img src="./bleh.jpg"/>
+</p>
 
 **Bleh!** is a command-line utility to print images on the MXW01 Bluetooth thermal printer.
 It supports 1-bit (1bpp) and 4-bit (4bpp) printing, various dithering algorithms, PNG preview output, and direct communication with the printer via BLE.
