@@ -1,7 +1,7 @@
 # Bleh!
 
 <p align=center>
-<img src="./bleh.jpg"/>
+<img width=320 src="./demo.jpg"/>
 </p>
 
 **Bleh!** is a command-line utility to print images on the MXW01 Bluetooth thermal printer.
