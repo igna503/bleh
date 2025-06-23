@@ -280,24 +280,53 @@ func loadImageMonoFromImage(img image.Image, ditherType string) ([]byte, int, er
 }
 
 // loadImage4BitFromImage processes an image.Image to 4bpp packed byte format
-func loadImage4BitFromImage(img image.Image) ([]byte, int, error) {
+func loadImage4BitFromImage(img image.Image, ditherType string) ([]byte, int, error) {
 	ratio := float64(img.Bounds().Dx()) / float64(img.Bounds().Dy())
 	height := int(float64(linePixels) / ratio)
 	img = imaging.Resize(img, linePixels, height, imaging.Lanczos)
 	img = imaging.Grayscale(img)
 
-	pixels := make([]byte, (linePixels*height)/2)
-	for y := 0; y < height; y++ {
-		for x := 0; x < linePixels; x++ {
-			gray := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
-			level := (255 - gray.Y) >> 4
+	palette := make([]color.Color, 16)
+	for i := 0; i < 16; i++ {
+		v := uint8(i * 17)
+		palette[i] = color.Gray{Y: 255 - v}
+	}
 
-			idx := (y*linePixels + x) >> 1
-			shift := uint(((x & 1) ^ 1) << 2) // 4 if even, 0 if odd
+	if ditherType != "none" {
+		d := dither.NewDitherer(palette)
+		switch ditherType {
+		case "floyd":
+			d.Matrix = dither.FloydSteinberg
+		case "bayer2x2":
+			d.Mapper = dither.Bayer(2, 2, 0.2)
+		case "bayer4x4":
+			d.Mapper = dither.Bayer(4, 4, 0.2)
+		case "bayer8x8":
+			d.Mapper = dither.Bayer(8, 8, 0.2)
+		case "bayer16x16":
+			d.Mapper = dither.Bayer(16, 16, 0.2)
+		case "atkinson":
+			d.Matrix = dither.Atkinson
+		case "jjn":
+			d.Matrix = dither.JarvisJudiceNinke
+		default:
+			return nil, 0, fmt.Errorf("unknown dither type: %s", ditherType)
+		}
+		img = d.DitherCopy(img)
+	}
+
+	width := linePixels
+	pixels := make([]byte, (width*height)/2)
+
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			gray := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
+			level := (255 - gray.Y) >> 4 // 0..15, inverted logic
+			idx := (y*width + x) >> 1
+			shift := uint(((x & 1) ^ 1) << 2)
 			pixels[idx] |= level << shift
 		}
 	}
-
 	return pixels, height, nil
 }
 
@@ -412,6 +441,109 @@ func renderPreviewFrom4bpp(pixels []byte, width, height int) image.Image {
 func main() {
 	flag.Parse()
 
+	needNotifications := getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0
+
+	if needNotifications {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+
+		d, err := linux.NewDevice()
+		if err != nil {
+			log.Fatalf("Failed to open BLE device: %v", err)
+		}
+		ble.SetDefaultDevice(d)
+
+		log.Println("Scanning for printer...")
+		log.Println("Connecting...")
+		var adv ble.Advertisement
+		ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
+		err = ble.Scan(ctxScan, false, func(a ble.Advertisement) {
+			if a.LocalName() == targetPrinterName {
+				adv = a
+				cancel()
+			}
+		}, nil)
+		if err != nil && err != context.Canceled {
+			log.Fatalf("Scan error: %v", err)
+		}
+		if adv == nil {
+			log.Println("Printer not found.")
+			return
+		}
+
+		client, err := ble.Dial(ctx, adv.Addr())
+		if err != nil {
+			log.Fatalf("Connect failed: %v", err)
+		}
+		defer client.CancelConnection()
+
+		mtu, err := client.ExchangeMTU(100)
+		if err != nil {
+			log.Printf("MTU negotiation failed: %v", err)
+		} else {
+			log.Printf("Negotiated ATT MTU: %d", mtu)
+		}
+		var printChr, notifyChr *ble.Characteristic
+		services, err := client.DiscoverServices([]ble.UUID{mainServiceUUID})
+		if err != nil || len(services) == 0 {
+			log.Fatalf("Service discovery failed: %v", err)
+		}
+		svc := services[0]
+		chars, err := client.DiscoverCharacteristics(nil, svc)
+		if err != nil {
+			log.Fatalf("Characteristic discovery failed: %v", err)
+		}
+		for _, c := range chars {
+			switch c.UUID.String() {
+			case notifyCharacteristic.String():
+				notifyChr = c
+			case printCharacteristic.String():
+				printChr = c
+			}
+		}
+		if notifyChr != nil {
+			_, _ = client.DiscoverDescriptors(nil, notifyChr)
+			err = client.Subscribe(notifyChr, false, func(b []byte) {
+				parseNotification(b)
+			})
+			if err != nil {
+				log.Printf("Subscribe failed: %v – notifications will be ignored", err)
+			} else {
+				log.Println("Subscribed to printer notifications.")
+			}
+		}
+		if getStatus {
+			sendSimpleCommand(client, printChr, 0xA1)
+		}
+		if getBattery {
+			sendSimpleCommand(client, printChr, 0xAB)
+		}
+		if getVersion {
+			sendSimpleCommand(client, printChr, 0xB1)
+		}
+		if getPrintType {
+			sendSimpleCommand(client, printChr, 0xB0)
+		}
+		if getQueryCount {
+			sendSimpleCommand(client, printChr, 0xA7)
+		}
+		if ejectPaper > 0 {
+			sendLineCommand(client, printChr, 0xA3, ejectPaper)
+		}
+		if retractPaper > 0 {
+			sendLineCommand(client, printChr, 0xA4, retractPaper)
+		}
+		if getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0 {
+			log.Println("Waiting for notifications...")
+			time.Sleep(2 * time.Second)
+		}
+		if flag.NArg() < 1 {
+			return // no image to print, other commands may have run
+		} else if flag.NArg() >= 1 && needNotifications {
+			log.Fatalf("Refusing to print and query at the same time due to a firmware bug. Please run print and query commands separately.")
+		}
+	}
+
 	var printMode PrintMode
 	switch mode {
 	case "1bpp":
@@ -437,7 +569,7 @@ func main() {
 	case Mode1bpp:
 		pixels, height, err = loadImageMonoFromImage(img, ditherType)
 	case Mode4bpp:
-		pixels, height, err = loadImage4BitFromImage(img)
+		pixels, height, err = loadImage4BitFromImage(img, ditherType)
 	}
 	if err != nil {
 		log.Fatalf("Image conversion error: %v", err)
@@ -482,7 +614,7 @@ func main() {
 	ble.SetDefaultDevice(d)
 
 	log.Println("Scanning for printer...")
-
+	log.Println("Connecting...")
 	var adv ble.Advertisement
 	ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
 	err = ble.Scan(ctxScan, false, func(a ble.Advertisement) {
@@ -499,7 +631,6 @@ func main() {
 		return
 	}
 
-	log.Println("Connecting...")
 	client, err := ble.Dial(ctx, adv.Addr())
 	if err != nil {
 		log.Fatalf("Connect failed: %v", err)
@@ -512,7 +643,7 @@ func main() {
 	} else {
 		log.Printf("Negotiated ATT MTU: %d", mtu)
 	}
-
+	var printChr, dataChr *ble.Characteristic
 	services, err := client.DiscoverServices([]ble.UUID{mainServiceUUID})
 	if err != nil || len(services) == 0 {
 		log.Fatalf("Service discovery failed: %v", err)
@@ -522,66 +653,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Characteristic discovery failed: %v", err)
 	}
-
-	var printChr, dataChr, notifyChr *ble.Characteristic
 	for _, c := range chars {
 		switch c.UUID.String() {
-		case printCharacteristic.String():
-			printChr = c
 		case dataCharacteristic.String():
 			dataChr = c
-		case notifyCharacteristic.String():
-			notifyChr = c
+		case printCharacteristic.String():
+			printChr = c
 		}
 	}
+
 	if printChr == nil {
 		log.Fatalf("Missing required print characteristic")
-	}
-
-	needNotifications := getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0
-
-	if notifyChr != nil && needNotifications {
-		_, _ = client.DiscoverDescriptors(nil, notifyChr)
-		err = client.Subscribe(notifyChr, false, func(b []byte) {
-			parseNotification(b)
-		})
-		if err != nil {
-			log.Printf("Subscribe failed: %v – notifications will be ignored", err)
-		} else {
-			log.Println("Subscribed to printer notifications.")
-		}
-	}
-
-	// Execute simple commands first
-	if getStatus {
-		sendSimpleCommand(client, printChr, 0xA1)
-	}
-	if getBattery {
-		sendSimpleCommand(client, printChr, 0xAB)
-	}
-	if getVersion {
-		sendSimpleCommand(client, printChr, 0xB1)
-	}
-	if getPrintType {
-		sendSimpleCommand(client, printChr, 0xB0)
-	}
-	if getQueryCount {
-		sendSimpleCommand(client, printChr, 0xA7)
-	}
-	if ejectPaper > 0 {
-		sendLineCommand(client, printChr, 0xA3, ejectPaper)
-	}
-	if retractPaper > 0 {
-		sendLineCommand(client, printChr, 0xA4, retractPaper)
-	}
-	if getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0 {
-		log.Println("Waiting for notifications...")
-		time.Sleep(2 * time.Second)
-	}
-	if flag.NArg() < 1 {
-		return // no image to print, other commands may have run
-	} else if flag.NArg() >= 1 && needNotifications {
-		log.Fatalf("Refusing to print and query at the same time due to a firmware bug. Please run print and query commands separately.")
 	}
 
 	i := intensity
