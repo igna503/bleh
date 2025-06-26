@@ -459,10 +459,8 @@ func findPrinter(ctx context.Context) (ble.Advertisement, error) {
 	ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
 	log.Println("Scanning for printer...")
 	err := ble.Scan(ctxScan, false, func(a ble.Advertisement) {
-		fmt.Printf("Found advertisement: %s, addr: %s\n", a.LocalName(), a.Addr())
 		if address != "" {
 			if a.Addr().String() == addr.String() { // Wonder why this works and not direct comparison
-				println("Found target printer by address:", a.Addr())
 				adv = a
 				cancel()
 			}
@@ -477,6 +475,7 @@ func findPrinter(ctx context.Context) (ble.Advertisement, error) {
 	if adv == nil {
 		return nil, fmt.Errorf("printer not found")
 	}
+	log.Println("Found target printer with address:", adv.Addr().String())
 	return adv, nil
 }
 
@@ -618,11 +617,13 @@ func main() {
 	// Get image path
 	imagePath := flag.Arg(0)
 
-	pixels, height := []byte(nil), int(0)
+	pixels, height, err := []byte(nil), int(0), error(nil)
 
-	pixels, height, err := loadAndProcessImage(imagePath, printMode, ditherType)
-	if err != nil {
-		log.Fatalf("Failed to load and process image: %v", err)
+	if imagePath != "" {
+		pixels, height, err = loadAndProcessImage(imagePath, printMode, ditherType)
+		if err != nil {
+			log.Fatalf("Failed to load and process image: %v", err)
+		}
 	}
 
 	if outputPath != "" {
