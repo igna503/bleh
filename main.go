@@ -53,7 +53,8 @@ var (
 	ejectPaper           uint
 	retractPaper         uint
 	outputPath           string
-	version		     = "dev"
+	address              string
+	version              = "dev"
 )
 
 func init() {
@@ -90,11 +91,16 @@ func init() {
 	flag.StringVar(&outputPath, "o", "", "Output PNG preview instead of printing (specify output path)")
 	flag.StringVar(&outputPath, "output", "", "Output PNG preview instead of printing (specify output path)")
 
+	flag.StringVar(&address, "a", "", "Connect to printer by MAC address")
+	flag.StringVar(&address, "address", "", "Connect to printer by MAC address")
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Bleh! Cat Printer Utility for MXW01, version %s\n",version)
+		fmt.Fprintf(os.Stderr, "Bleh! Cat Printer Utility for MXW01, version %s\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <image_path or ->\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, `
 Options:
+  -h, --help               Show this help message
+  -a, --address <mac>      Connect to printer by MAC address
   -i, --intensity int      Print intensity (0-100) (default 80)
   -m, --mode string        Print mode: 1bpp or 4bpp (default "1bpp")
   -d, --dither string      Dither method: none, floyd, bayer2x2, bayer4x4, bayer8x8, bayer16x16, atkinson, jjn (default "none")
@@ -440,112 +446,164 @@ func renderPreviewFrom4bpp(pixels []byte, width, height int) image.Image {
 	return img
 }
 
-func main() {
-	flag.Parse()
+func findPrinter(ctx context.Context) (ble.Advertisement, error) {
+	var addr ble.Addr
+	var adv ble.Advertisement
 
-	needNotifications := getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0
+	if address != "" {
+		log.Printf("Connecting directly to MAC address: %s", address)
+		addr = ble.NewAddr(address)
+		fmt.Printf("Using address: %s\n", addr)
+	}
 
-	if needNotifications {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-		defer stop()
-
-		d, err := linux.NewDevice()
-		if err != nil {
-			log.Fatalf("Failed to open BLE device: %v", err)
-		}
-		ble.SetDefaultDevice(d)
-
-		log.Println("Scanning for printer...")
-		log.Println("Connecting...")
-		var adv ble.Advertisement
-		ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
-		err = ble.Scan(ctxScan, false, func(a ble.Advertisement) {
-			if a.LocalName() == targetPrinterName {
+	ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
+	log.Println("Scanning for printer...")
+	err := ble.Scan(ctxScan, false, func(a ble.Advertisement) {
+		fmt.Printf("Found advertisement: %s, addr: %s\n", a.LocalName(), a.Addr())
+		if address != "" {
+			if a.Addr().String() == addr.String() { // Wonder why this works and not direct comparison
+				println("Found target printer by address:", a.Addr())
 				adv = a
 				cancel()
 			}
-		}, nil)
-		if err != nil && err != context.Canceled {
-			log.Fatalf("Scan error: %v", err)
+		} else if a.LocalName() == targetPrinterName {
+			adv = a
+			cancel()
 		}
-		if adv == nil {
-			log.Println("Printer not found.")
-			return
-		}
+	}, nil)
+	if err != nil && err != context.Canceled {
+		return nil, fmt.Errorf("scan error, %v", err)
+	}
+	if adv == nil {
+		return nil, fmt.Errorf("printer not found")
+	}
+	return adv, nil
+}
 
-		client, err := ble.Dial(ctx, adv.Addr())
-		if err != nil {
-			log.Fatalf("Connect failed: %v", err)
-		}
-		defer client.CancelConnection()
-
-		mtu, err := client.ExchangeMTU(100)
-		if err != nil {
-			log.Printf("MTU negotiation failed: %v", err)
-		} else {
-			log.Printf("Negotiated ATT MTU: %d", mtu)
-		}
-		var printChr, notifyChr *ble.Characteristic
-		services, err := client.DiscoverServices([]ble.UUID{mainServiceUUID})
-		if err != nil || len(services) == 0 {
-			log.Fatalf("Service discovery failed: %v", err)
-		}
-		svc := services[0]
-		chars, err := client.DiscoverCharacteristics(nil, svc)
-		if err != nil {
-			log.Fatalf("Characteristic discovery failed: %v", err)
-		}
-		for _, c := range chars {
-			switch c.UUID.String() {
-			case notifyCharacteristic.String():
-				notifyChr = c
-			case printCharacteristic.String():
-				printChr = c
-			}
-		}
-		if notifyChr != nil {
-			_, _ = client.DiscoverDescriptors(nil, notifyChr)
-			err = client.Subscribe(notifyChr, false, func(b []byte) {
-				parseNotification(b)
-			})
-			if err != nil {
-				log.Printf("Subscribe failed: %v – notifications will be ignored", err)
-			} else {
-				log.Println("Subscribed to printer notifications.")
-			}
-		}
-		if getStatus {
-			sendSimpleCommand(client, printChr, 0xA1)
-		}
-		if getBattery {
-			sendSimpleCommand(client, printChr, 0xAB)
-		}
-		if getVersion {
-			sendSimpleCommand(client, printChr, 0xB1)
-		}
-		if getPrintType {
-			sendSimpleCommand(client, printChr, 0xB0)
-		}
-		if getQueryCount {
-			sendSimpleCommand(client, printChr, 0xA7)
-		}
-		if ejectPaper > 0 {
-			sendLineCommand(client, printChr, 0xA3, ejectPaper)
-		}
-		if retractPaper > 0 {
-			sendLineCommand(client, printChr, 0xA4, retractPaper)
-		}
-		if getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0 {
-			log.Println("Waiting for notifications...")
-			time.Sleep(2 * time.Second)
-		}
-		if flag.NArg() < 1 {
-			return // no image to print, other commands may have run
-		} else if flag.NArg() >= 1 && needNotifications {
-			log.Fatalf("Refusing to print and query at the same time due to a firmware bug. Please run print and query commands separately.")
+func discoverChars(client ble.Client) (*ble.Characteristic, *ble.Characteristic, *ble.Characteristic, error) {
+	var printChr, notifyChr, dataChr *ble.Characteristic
+	services, err := client.DiscoverServices([]ble.UUID{mainServiceUUID})
+	if err != nil || len(services) == 0 {
+		return nil, nil, nil, fmt.Errorf("service discovery failed: %v", err)
+	}
+	svc := services[0]
+	chars, err := client.DiscoverCharacteristics(nil, svc)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("characteristic discovery failed: %v", err)
+	}
+	for _, c := range chars {
+		switch c.UUID.String() {
+		case printCharacteristic.String():
+			printChr = c
+		case notifyCharacteristic.String():
+			notifyChr = c
+		case dataCharacteristic.String():
+			dataChr = c
 		}
 	}
+	return printChr, notifyChr, dataChr, nil
+}
 
+func subToNotifs(client ble.Client, notifyChr *ble.Characteristic) error {
+	if notifyChr != nil {
+		_, _ = client.DiscoverDescriptors(nil, notifyChr)
+		err := client.Subscribe(notifyChr, false, func(b []byte) {
+			parseNotification(b)
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		} else {
+			log.Println("Subscribed to printer notifications.")
+		}
+	} else {
+		return fmt.Errorf("missing notification characteristic")
+	}
+	return nil
+}
+
+func loadAndProcessImage(imagePath string, printMode PrintMode, ditherType string) ([]byte, int, error) {
+	img, err := decodeImage(imagePath)
+
+	if err != nil {
+		log.Fatalf("Image load error: %v", err)
+	}
+	img = padImageToMinLines(img, minLines)
+	var pixels []byte
+	var height int
+
+	// Convert image to the desired format
+	switch printMode {
+	case Mode1bpp:
+		pixels, height, err = loadImageMonoFromImage(img, ditherType)
+	case Mode4bpp:
+		pixels, height, err = loadImage4BitFromImage(img, ditherType)
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("image conversion error: %v", err)
+	}
+
+	return pixels, height, nil
+}
+
+func loadPrinter() (ble.Client, *ble.Characteristic, *ble.Characteristic, *ble.Characteristic, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	// Initialize BLE device
+	d, err := linux.NewDevice()
+	if err != nil {
+		log.Fatalf("Failed to open BLE device: %v", err)
+	}
+	ble.SetDefaultDevice(d)
+
+	// Find printer
+	adv, err := findPrinter(ctx)
+	if err != nil {
+		log.Fatalf("Failed to find printer: %v", err)
+	}
+
+	// Connect to printer
+	log.Println("Connecting...")
+	client, err := ble.Dial(ctx, adv.Addr())
+	if err != nil {
+		log.Fatalf("Connect failed: %v", err)
+	}
+
+	// Negotiate large MTU if possible
+	mtu, err := client.ExchangeMTU(100)
+	if err != nil {
+		log.Printf("MTU negotiation failed: %v", err)
+	} else {
+		log.Printf("Negotiated ATT MTU: %d", mtu)
+	}
+
+	// Discover services and characteristics
+	printChr, notifyChr, dataChr, err := discoverChars(client)
+	if err != nil {
+		log.Fatalf("Characteristic discovery failed: %v", err)
+	}
+
+	return client, printChr, notifyChr, dataChr, nil
+}
+
+func main() {
+	flag.Parse()
+
+	if outputPath != "-" {
+		log.Println("Bleh! Cat Printer Utility for MXW01, version", version)
+	}
+
+	needNotifications := getStatus || getBattery || getVersion || getPrintType || getQueryCount || ejectPaper > 0 || retractPaper > 0
+
+	needPrinter := needNotifications || (flag.NArg() > 0 && outputPath == "")
+
+	if !needPrinter && outputPath == "" {
+		log.Println("Nothing to do. Use -h for help.")
+		log.Println("Done!")
+		return
+	}
+
+	// Get print mode
 	var printMode PrintMode
 	switch mode {
 	case "1bpp":
@@ -556,25 +614,15 @@ func main() {
 		fmt.Println("Invalid mode. Use '1bpp' or '4bpp'.")
 		return
 	}
+
+	// Get image path
 	imagePath := flag.Arg(0)
 
-	var pixels []byte
-	var height int
-	img, err := decodeImage(imagePath)
+	pixels, height := []byte(nil), int(0)
 
+	pixels, height, err := loadAndProcessImage(imagePath, printMode, ditherType)
 	if err != nil {
-		log.Fatalf("Image load error: %v", err)
-	}
-	img = padImageToMinLines(img, minLines)
-
-	switch printMode {
-	case Mode1bpp:
-		pixels, height, err = loadImageMonoFromImage(img, ditherType)
-	case Mode4bpp:
-		pixels, height, err = loadImage4BitFromImage(img, ditherType)
-	}
-	if err != nil {
-		log.Fatalf("Image conversion error: %v", err)
+		log.Fatalf("Failed to load and process image: %v", err)
 	}
 
 	if outputPath != "" {
@@ -601,89 +649,75 @@ func main() {
 			log.Fatalf("Failed to write PNG preview: %v", err)
 		}
 		if outputPath != "-" {
-			fmt.Printf("Preview PNG written to %s\n", outputPath)
+			log.Printf("Preview PNG written to %s\n", outputPath)
 		}
 		return
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	if needPrinter {
+		client, printChr, notifyChr, dataChr, err := loadPrinter()
 
-	d, err := linux.NewDevice()
-	if err != nil {
-		log.Fatalf("Failed to open BLE device: %v", err)
-	}
-	ble.SetDefaultDevice(d)
+		defer client.CancelConnection()
 
-	log.Println("Scanning for printer...")
-	log.Println("Connecting...")
-	var adv ble.Advertisement
-	ctxScan, cancel := context.WithTimeout(ctx, scanTimeout)
-	err = ble.Scan(ctxScan, false, func(a ble.Advertisement) {
-		if a.LocalName() == targetPrinterName {
-			adv = a
-			cancel()
+		if err != nil {
+			log.Fatalf("Failed to load printer: %v", err)
 		}
-	}, nil)
-	if err != nil && err != context.Canceled {
-		log.Fatalf("Scan error: %v", err)
-	}
-	if adv == nil {
-		log.Println("Printer not found.")
-		return
-	}
 
-	client, err := ble.Dial(ctx, adv.Addr())
-	if err != nil {
-		log.Fatalf("Connect failed: %v", err)
-	}
-	defer client.CancelConnection()
+		if needNotifications {
+			// Subscribe to notifications
+			err := subToNotifs(client, notifyChr)
+			if err != nil {
+				log.Fatalf("Failed to subscribe to notifications: %v", err)
+			}
 
-	mtu, err := client.ExchangeMTU(100)
-	if err != nil {
-		log.Printf("MTU negotiation failed: %v", err)
-	} else {
-		log.Printf("Negotiated ATT MTU: %d", mtu)
-	}
-	var printChr, dataChr *ble.Characteristic
-	services, err := client.DiscoverServices([]ble.UUID{mainServiceUUID})
-	if err != nil || len(services) == 0 {
-		log.Fatalf("Service discovery failed: %v", err)
-	}
-	svc := services[0]
-	chars, err := client.DiscoverCharacteristics(nil, svc)
-	if err != nil {
-		log.Fatalf("Characteristic discovery failed: %v", err)
-	}
-	for _, c := range chars {
-		switch c.UUID.String() {
-		case dataCharacteristic.String():
-			dataChr = c
-		case printCharacteristic.String():
-			printChr = c
+			// TODO: check if the firmware allows more than one command at a time
+			// Also find a neater way to handle this
+			if getStatus {
+				sendSimpleCommand(client, printChr, 0xA1)
+			}
+			if getBattery {
+				sendSimpleCommand(client, printChr, 0xAB)
+			}
+			if getVersion {
+				sendSimpleCommand(client, printChr, 0xB1)
+			}
+			if getPrintType {
+				sendSimpleCommand(client, printChr, 0xB0)
+			}
+			if getQueryCount {
+				sendSimpleCommand(client, printChr, 0xA7)
+			}
+			if ejectPaper > 0 {
+				sendLineCommand(client, printChr, 0xA3, ejectPaper)
+			}
+			if retractPaper > 0 {
+				sendLineCommand(client, printChr, 0xA4, retractPaper)
+			}
+			log.Println("Waiting for notifications...")
+			time.Sleep(2 * time.Second)
+
+			if flag.NArg() < 1 {
+				return // no image to print
+			} else {
+				log.Fatalf("Refusing to print and query at the same time due to a firmware bug. Please run print and query commands separately.")
+			}
 		}
-	}
+		if printChr == nil {
+			log.Fatalf("Missing required print characteristic")
+		}
 
-	if printChr == nil {
-		log.Fatalf("Missing required print characteristic")
-	}
+		i := max(intensity, 0)
+		i = min(i, 100)
+		intensityByte := byte(i)
 
-	i := intensity
-	if i < 0 {
-		i = 0
-	}
-	if i > 100 {
-		i = 100
-	}
-	intensityByte := byte(i)
+		if dataChr == nil {
+			log.Fatalf("Missing required data characteristic")
+		}
 
-	if dataChr == nil {
-		log.Fatalf("Missing required data characteristic")
-	}
-
-	err = sendImageBufferToPrinter(client, dataChr, printChr, pixels, height, printMode, intensityByte)
-	if err != nil {
-		log.Fatalf("Failed to print image: %v", err)
+		err = sendImageBufferToPrinter(client, dataChr, printChr, pixels, height, printMode, intensityByte)
+		if err != nil {
+			log.Fatalf("Failed to print image: %v", err)
+		}
 	}
 
 	log.Println("Done!")
