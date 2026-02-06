@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="blehd"
+description="Bleh MXW01 privileged helper daemon"
+
+command="/usr/local/bin/blehd"
+command_args="--socket /run/bleh/blehd.sock --group bleh"
+command_background=true
+pidfile="/run/${name}.pid"
+
+start_pre() {
+	checkpath -d -m 0755 /run/bleh
+}
+
+depend() {
+	after bluetooth
+}
