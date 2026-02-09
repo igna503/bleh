@@ -24,15 +24,8 @@ func SendImageBufferToPrinter(client ble.Client, dataChr, printChr *ble.Characte
 		bytesPerLine = LinePixels / 2
 	}
 
-	// ATT_MTU includes 3 bytes of ATT overhead for Write Command/Request.
+	// Keep data writes conservative for stability across adapters/firmware.
 	payloadMTU := 20
-	if attMTU > 3 {
-		payloadMTU = attMTU - 3
-	}
-	if payloadMTU < 1 {
-		payloadMTU = 1
-	}
-
 	for y := 0; y < height; y++ {
 		slice := pixels[y*bytesPerLine : (y+1)*bytesPerLine]
 		for offset := 0; offset < len(slice); offset += payloadMTU {
