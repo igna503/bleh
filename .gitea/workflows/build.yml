@@ -57,7 +57,7 @@ jobs:
           echo "ARTIFACT=${name}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: https://github.com/christopherHX/gitea-upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
           path: |
